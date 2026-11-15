@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Three.js × Rapier 布娃娃 - 本地同目录加载</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; }
+    canvas { display: block; touch-action: none; }
+    #status {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      color: #aaa; font-family: system-ui, sans-serif; font-size: 14px;
+      background: rgba(0,0,0,0.8); padding: 12px 20px; border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.1); pointer-events: none;
+      transition: opacity 0.3s ease; z-index: 100; text-align: center; line-height: 1.5;
+    }
+    #info {
+      position: absolute; top: 16px; left: 16px; color: #eee;
+      font-family: system-ui, sans-serif; font-size: 13px;
+      background: rgba(0,0,0,0.6); padding: 8px 12px; border-radius: 6px;
+      pointer-events: none; z-index: 100;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">默认姿态 → 软限位 + 张力 + 肢体冲击</div>
+  <div id="status">正在从本地加载依赖...</div>
+
+  <script type="module">
+    // 全局变量
+    let THREE, RAPIER, world, controls;
+    let renderer, camera, scene;
+    const boneMap = new Map();
+    const bodyMap = new Map();
+    const initialWorldQuats = new Map();
+    let physReady = false;
+
+    const statusEl = document.getElementById('status');
+    const setStatus = (msg, color = '#aaa') => {
+      statusEl.textContent = msg;
+      statusEl.style.color = color;
+    };
+
+    // ==========================================
+    // 1. 轻量级轨道控制器 (零依赖，兼容移动端)
+    // ==========================================
+    class SimpleOrbitControls {
+      constructor(camera, domElement) {
+        this.camera = camera;
+        this.domElement = domElement;
+        this.target = new THREE.Vector3(0, 0.3, 0);
+        this.minDistance = 1;
+        this.maxDistance = 30;
+        this.spherical = new THREE.Spherical();
+        this.sphericalDelta = new THREE.Spherical();
+        this.scale = 1;
+        this.dragging = false;
+        this.pointers = [];
+
+        const offset = new THREE.Vector3().copy(camera.position).sub(this.target);
+        this.spherical.setFromVector3(offset);
+
+        this.domElement.addEventListener('pointerdown', this.onPointerDown.bind(this));
+        this.domElement.addEventListener('pointermove', this.onPointerMove.bind(this));
+        this.domElement.addEventListener('pointerup', this.onPointerUp.bind(this));
+        this.domElement.addEventListener('pointercancel', this.onPointerUp.bind(this));
+        this.domElement.addEventListener('wheel', this.onWheel.bind(this), { passive: false });
+      }
+
+      onPointerDown(e) {
+        this.domElement.setPointerCapture(e.pointerId);
+        this.pointers.push({ id: e.pointerId, x: e.clientX, y: e.clientY });
+        this.dragging = true;
+      }
+
+      onPointerMove(e) {
+        if (!this.dragging) return;
+        const pointer = this.pointers.find(p => p.id === e.pointerId);
+        if (!pointer) return;
+
+        if (this.pointers.length === 1) {
+          const deltaX = e.clientX - pointer.x;
+          const deltaY = e.clientY - pointer.y;
+          this.sphericalDelta.theta -= 2 * Math.PI * deltaX / this.domElement.clientHeight;
+          this.sphericalDelta.phi -= 2 * Math.PI * deltaY / this.domElement.clientHeight;
+        } else if (this.pointers.length === 2) {
+          const other = this.pointers.find(p => p.id !== e.pointerId);
+          const dx = e.clientX - other.x;
+          const dy = e.clientY - other.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (pointer.dist) {
+            this.scale *= pointer.dist / dist;
+          }
+          pointer.dist = dist;
+          return;
+        }
+        pointer.x = e.clientX;
+        pointer.y = e.clientY;
+      }
+
+      onPointerUp(e) {
+        this.domElement.releasePointerCapture(e.pointerId);
+        this.pointers = this.pointers.filter(p => p.id !== e.pointerId);
+        if (this.pointers.length === 0) this.dragging = false;
+      }
+
+      onWheel(e) {
+        e.preventDefault();
+        this.scale *= e.deltaY > 0 ? 1.1 : 0.9;
+      }
+
+      update() {
+        const offset = new THREE.Vector3().copy(this.camera.position).sub(this.target);
+        this.spherical.setFromVector3(offset);
+        this.spherical.theta += this.sphericalDelta.theta;
+        this.spherical.phi += this.sphericalDelta.phi;
+        this.spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, this.spherical.phi));
+        this.spherical.radius = Math.max(this.minDistance, Math.min(this.maxDistance, this.spherical.radius * this.scale));
+        
+        offset.setFromSpherical(this.spherical);
+        this.camera.position.copy(this.target).add(offset);
+        this.camera.lookAt(this.target);
+        
+        this.sphericalDelta.theta *= 0.9;
+        this.sphericalDelta.phi *= 0.9;
+        this.scale = 1;
+      }
+    }
+
+    // ==========================================
+    // 2. Epic 标准骨骼数据
+    // ==========================================
+    const BONE_DEFS = [
+      { name: 'pelvis',      parent: null,        len: 0.22, rad: 0.16, pos: [0, 0.85, 0] },
+      { name: 'spine_01',    parent: 'pelvis',    len: 0.12, rad: 0.12, pos: [0, 0.11, 0] },
+      { name: 'spine_02',    parent: 'spine_01',  len: 0.12, rad: 0.12, pos: [0, 0.11, 0] },
+      { name: 'spine_03',    parent: 'spine_02',  len: 0.10, rad: 0.12, pos: [0, 0.11, 0] },
+      { name: 'neck_01',     parent: 'spine_03',  len: 0.08, rad: 0.05, pos: [0, 0.10, 0] },
+      { name: 'head',        parent: 'neck_01',   len: 0.18, rad: 0.10, pos: [0, 0.07, 0] },
+      { name: 'clavicle_l',  parent: 'spine_03',  len: 0.14, rad: 0.05, pos: [-0.06, 0.06, 0] },
+      { name: 'upperarm_l',  parent: 'clavicle_l',len: 0.26, rad: 0.05, pos: [-0.12, -0.02, 0] },
+      { name: 'lowerarm_l',  parent: 'upperarm_l',len: 0.24, rad: 0.04, pos: [0, -0.24, 0] },
+      { name: 'hand_l',      parent: 'lowerarm_l',len: 0.10, rad: 0.035, pos: [0, -0.22, 0] },
+      { name: 'clavicle_r',  parent: 'spine_03',  len: 0.14, rad: 0.05, pos: [0.06, 0.06, 0] },
+      { name: 'upperarm_r',  parent: 'clavicle_r',len: 0.26, rad: 0.05, pos: [0.12, -0.02, 0] },
+      { name: 'lowerarm_r',  parent: 'upperarm_r',len: 0.24, rad: 0.04, pos: [0, -0.24, 0] },
+      { name: 'hand_r',      parent: 'lowerarm_r',len: 0.10, rad: 0.035, pos: [0, -0.22, 0] },
+      { name: 'thigh_l',     parent: 'pelvis',    len: 0.36, rad: 0.07, pos: [-0.09, -0.08, 0] },
+      { name: 'calf_l',      parent: 'thigh_l',   len: 0.34, rad: 0.055,pos: [0, -0.34, 0] },
+      { name: 'foot_l',      parent: 'calf_l',    len: 0.12, rad: 0.04, pos: [0, -0.32, 0.04] },
+      { name: 'thigh_r',     parent: 'pelvis',    len: 0.36, rad: 0.07, pos: [0.09, -0.08, 0] },
+      { name: 'calf_r',      parent: 'thigh_r',   len: 0.34, rad: 0.055,pos: [0, -0.34, 0] },
+      { name: 'foot_r',      parent: 'calf_r',    len: 0.12, rad: 0.04, pos: [0, -0.32, 0.04] },
+    ];
+
+    const JOINT_LIMITS = {
+      spine_01:   { swing: 0.25, twist: 0.15, stiffness: 120, damping: 12 },
+      spine_02:   { swing: 0.25, twist: 0.15, stiffness: 120, damping: 12 },
+      spine_03:   { swing: 0.20, twist: 0.12, stiffness: 100, damping: 10 },
+      neck_01:    { swing: 0.30, twist: 0.20, stiffness: 80,  damping: 8 },
+      head:       { swing: 0.25, twist: 0.15, stiffness: 80,  damping: 8 },
+      clavicle_l: { swing: 0.20, twist: 0.10, stiffness: 150, damping: 15 },
+      upperarm_l: { swing: 1.2,  twist: 0.5,  stiffness: 40,  damping: 6 },
+      lowerarm_l: { swing: 0.9,  twist: 0.3,  stiffness: 60,  damping: 8 },
+      hand_l:     { swing: 0.5,  twist: 0.3,  stiffness: 30,  damping: 5 },
+      clavicle_r: { swing: 0.20, twist: 0.10, stiffness: 150, damping: 15 },
+      upperarm_r: { swing: 1.2,  twist: 0.5,  stiffness: 40,  damping: 6 },
+      lowerarm_r: { swing: 0.9,  twist: 0.3,  stiffness: 60,  damping: 8 },
+      hand_r:     { swing: 0.5,  twist: 0.3,  stiffness: 30,  damping: 5 },
+      thigh_l:    { swing: 1.0,  twist: 0.4,  stiffness: 50,  damping: 7 },
+      calf_l:     { swing: 0.9,  twist: 0.2,  stiffness: 60,  damping: 8 },
+      foot_l:     { swing: 0.4,  twist: 0.2,  stiffness: 40,  damping: 6 },
+      thigh_r:    { swing: 1.0,  twist: 0.4,  stiffness: 50,  damping: 7 },
+      calf_r:     { swing: 0.9,  twist: 0.2,  stiffness: 60,  damping: 8 },
+      foot_r:     { swing: 0.4,  twist: 0.2,  stiffness: 40,  damping: 6 },
+    };
+
+    // ==========================================
+    // 3. 启动与初始化
+    // ==========================================
+    async function start() {
+      try {
+        setStatus('正在加载同目录文件...');
+        
+        // 从同目录加载模块 (注意路径前缀 ./)
+        const threeModule = await import('./three.module.js');
+        const rapierModule = await import('./rapier.es.js');
+        
+        THREE = threeModule;
+        RAPIER = rapierModule.default || rapierModule;
+        
+        setStatus('正在初始化物理引擎...');
+        await RAPIER.init();
+        
+        initScene();
+        initPhysics();
+        
+        physReady = true;
+        setStatus('物理就绪', '#4caf50');
+        setTimeout(() => { statusEl.style.opacity = '0'; }, 1500);
+      } catch (err) {
+        console.error(err);
+        setStatus(`加载失败！\n请确保 three.module.js 和 rapier.es.js 在同一目录下。\n${err.message}`, '#ff6b6b');
+      }
+    }
+
+    function initScene() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x111111);
+      scene.fog = new THREE.Fog(0x111111, 15, 30);
+
+      camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+      camera.position.set(4, 2, 6);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      document.body.appendChild(renderer.domElement);
+
+      controls = new SimpleOrbitControls(camera, renderer.domElement);
+
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 1.2));
+      const dirLight = new THREE.DirectionalLight(0xffffff, 2.5);
+      dirLight.position.set(5, 8, 5);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.set(1024, 1024);
+      dirLight.shadow.camera.left = -5;
+      dirLight.shadow.camera.right = 5;
+      dirLight.shadow.camera.top = 5;
+      dirLight.shadow.camera.bottom = -5;
+      scene.add(dirLight);
+
+      const groundGeo = new THREE.PlaneGeometry(30, 30);
+      const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.9 });
+      const ground = new THREE.Mesh(groundGeo, groundMat);
+      ground.rotation.x = -Math.PI / 2;
+      ground.receiveShadow = true;
+      scene.add(ground);
+    }
+
+    function initPhysics() {
+      world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+      const groundBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+      world.createCollider(RAPIER.ColliderDesc.cuboid(15, 0.1, 15), groundBody);
+
+      buildSkeleton();
+      buildRagdoll();
+      recordInitialPose();
+      applyInitialImpulse();
+
+      animate();
+    }
+
+    function buildSkeleton() {
+      const root = new THREE.Bone();
+      root.name = 'root';
+      const boneObjects = [];
+
+      BONE_DEFS.forEach(def => {
+        const bone = new THREE.Bone();
+        bone.name = def.name;
+
+        if (def.parent === null) {
+          root.add(bone);
+          bone.position.set(def.pos[0], def.pos[1], def.pos[2]);
+        } else {
+          boneMap.get(def.parent).add(bone);
+          bone.position.set(def.pos[0], def.pos[1], def.pos[2]);
+        }
+
+        const geo = new THREE.CapsuleGeometry(def.rad, def.len * 0.8, 6, 12);
+        const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.position.y = -def.len / 2;
+        mesh.rotation.x = Math.PI / 2;
+        bone.add(mesh);
+
+        boneMap.set(def.name, bone);
+        boneObjects.push(bone);
+      });
+
+      scene.add(root);
+      scene.updateMatrixWorld(true);
+    }
+
+    function buildRagdoll() {
+      BONE_DEFS.forEach(def => {
+        const bone = boneMap.get(def.name);
+        const worldPos = new THREE.Vector3();
+        bone.getWorldPosition(worldPos);
+
+        const bodyPos = worldPos.clone();
+        bodyPos.y -= def.len / 2 * 0.8;
+
+        const halfHeight = Math.max(def.len / 2 - def.rad, 0.01);
+        const colliderDesc = RAPIER.ColliderDesc.capsule(halfHeight, def.rad)
+          .setDensity(1.0).setFriction(0.8).setRestitution(0.1);
+
+        const rigidBodyDesc = RAPIER.RigidBodyDesc.dynamic()
+          .setTranslation(bodyPos.x, bodyPos.y, bodyPos.z)
+          .setLinearDamping(0.5).setAngularDamping(1.5).setCcdEnabled(true);
+
+        const body = world.createRigidBody(rigidBodyDesc);
+        world.createCollider(colliderDesc, body);
+
+        const boneWorldQuat = new THREE.Quaternion();
+        bone.getWorldQuaternion(boneWorldQuat);
+        body.setRotation(boneWorldQuat, true);
+
+        bodyMap.set(def.name, body);
+      });
+
+      BONE_DEFS.forEach(def => {
+        if (!def.parent) return;
+        const parentBody = bodyMap.get(def.parent);
+        const childBody = bodyMap.get(def.name);
+        const childBone = boneMap.get(def.name);
+
+        const anchor1 = { x: childBone.position.x, y: childBone.position.y, z: childBone.position.z };
+        const anchor2 = { x: 0, y: 0, z: 0 };
+
+        const jointData = RAPIER.JointData.spherical(anchor1, anchor2);
+        const joint = world.createImpulseJoint(jointData, parentBody, childBody, true);
+
+        const limits = JOINT_LIMITS[def.name];
+        if (limits) {
+          if (joint.setLimits) joint.setLimits(-limits.swing, limits.swing, -limits.twist, limits.twist);
+          if (joint.configureMotorPosition) {
+            joint.configureMotorPosition(new RAPIER.Vector3(0, 0, 0), limits.stiffness, limits.damping);
+          }
+        }
+      });
+    }
+
+    function recordInitialPose() {
+      scene.updateMatrixWorld(true);
+      boneMap.forEach((bone, name) => {
+        const quat = new THREE.Quaternion();
+        bone.getWorldQuaternion(quat);
+        initialWorldQuats.set(name, quat.clone());
+      });
+    }
+
+    function applyInitialImpulse() {
+      const pelvisBody = bodyMap.get('pelvis');
+      if (pelvisBody) {
+        pelvisBody.applyImpulse({ x: 2.5, y: 1.5, z: 3.0 }, true);
+        pelvisBody.applyTorqueImpulse({ x: 0.5, y: 0.2, z: 1.0 }, true);
+      }
+      ['upperarm_l', 'upperarm_r', 'thigh_l', 'thigh_r'].forEach(name => {
+        const body = bodyMap.get(name);
+        if (body) {
+          body.applyImpulse({
+            x: (Math.random() - 0.5) * 1.5,
+            y: (Math.random() - 0.5) * 1.0,
+            z: (Math.random() - 0.5) * 1.5
+          }, true);
+        }
+      });
+    }
+
+    const _parentWorldQuat = new THREE.Quaternion();
+    const _targetWorldQuat = new THREE.Quaternion();
+    const _bodyQuat = new THREE.Quaternion();
+
+    function syncBones() {
+      BONE_DEFS.forEach(def => {
+        const body = bodyMap.get(def.name);
+        const bone = boneMap.get(def.name);
+        if (!body || !bone) return;
+
+        const rotation = body.rotation();
+        _bodyQuat.set(rotation.x, rotation.y, rotation.z, rotation.w);
+        const initialQuat = initialWorldQuats.get(def.name);
+        _targetWorldQuat.copy(_bodyQuat).multiply(initialQuat);
+
+        if (def.parent) {
+          boneMap.get(def.parent).getWorldQuaternion(_parentWorldQuat);
+        } else {
+          _parentWorldQuat.identity();
+        }
+
+        const localQuat = _parentWorldQuat.clone().invert().multiply(_targetWorldQuat);
+        bone.quaternion.copy(localQuat);
+
+        if (def.parent === null) {
+          const translation = body.translation();
+          bone.position.set(translation.x, translation.y, translation.z);
+        }
+        bone.updateMatrixWorld(true);
+      });
+    }
+
+    let lastTime = performance.now();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const now = performance.now();
+      const delta = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      if (physReady && world) {
+        world.timestep = delta;
+        world.step();
+        syncBones();
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      if (camera && renderer) {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      }
+    });
+
+    // 启动
+    start();
+  </script>
+</body>
+</html>
