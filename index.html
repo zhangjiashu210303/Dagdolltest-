@@ -3,119 +3,122 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Three.js × Rapier 布娃娃 - 本地同目录加载</title>
+  <title>Three.js × Rapier 布娃娃 - 稳定在线版</title>
   <style>
     body { margin: 0; overflow: hidden; background: #111; }
     canvas { display: block; touch-action: none; }
     #status {
       position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-      color: #aaa; font-family: system-ui, sans-serif; font-size: 14px;
-      background: rgba(0,0,0,0.8); padding: 12px 20px; border-radius: 8px;
-      border: 1px solid rgba(255,255,255,0.1); pointer-events: none;
-      transition: opacity 0.3s ease; z-index: 100; text-align: center; line-height: 1.5;
+      color: #fff; font-family: monospace; font-size: 14px;
+      background: rgba(0,0,0,0.9); padding: 16px 24px; border-radius: 8px;
+      border: 1px solid #444; pointer-events: none; z-index: 100; text-align: center; line-height: 1.6;
+      white-space: pre-wrap; max-width: 80vw;
     }
-    #info {
-      position: absolute; top: 16px; left: 16px; color: #eee;
-      font-family: system-ui, sans-serif; font-size: 13px;
-      background: rgba(0,0,0,0.6); padding: 8px 12px; border-radius: 6px;
-      pointer-events: none; z-index: 100;
-    }
+    .error { color: #ff5555 !important; border-color: #ff5555 !important; }
   </style>
 </head>
 <body>
-  <div id="info">默认姿态 → 软限位 + 张力 + 肢体冲击</div>
-  <div id="status">正在从本地加载依赖...</div>
+  <div id="status">正在从 CDN 加载依赖...</div>
 
-  <script type="module">
-    // 全局变量
-    let THREE, RAPIER, world, controls;
-    let renderer, camera, scene;
-    const boneMap = new Map();
-    const bodyMap = new Map();
-    const initialWorldQuats = new Map();
-    let physReady = false;
+  <!-- 使用最稳定的 UMD 形式加载库（全球 CDN 节点） -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.12.0/rapier.js"></script>
 
-    const statusEl = document.getElementById('status');
-    const setStatus = (msg, color = '#aaa') => {
-      statusEl.textContent = msg;
-      statusEl.style.color = color;
+  <script>
+    // 捕获所有报错并显示在屏幕上
+    window.onerror = function(msg, url, line, col, error) {
+      const el = document.getElementById('status');
+      el.className = 'error';
+      el.style.opacity = '1';
+      el.innerHTML = `❌ 发生错误：\n${msg}\n位置: 行 ${line}`;
     };
 
+    window.addEventListener('DOMContentLoaded', async () => {
+      const statusEl = document.getElementById('status');
+      
+      // 检查库是否成功加载
+      if (typeof THREE === 'undefined') {
+        return window.onerror('未找到 THREE 库，请检查网络是否能访问 cdn.jsdelivr.net', '', 0);
+      }
+      if (typeof RAPIER === 'undefined') {
+        return window.onerror('未找到 RAPIER 库，请检查网络是否能访问 cdn.jsdelivr.net', '', 0);
+      }
+
+      statusEl.textContent = '正在初始化物理引擎 (WASM)...';
+      
+      try {
+        // 初始化 Rapier WASM
+        await RAPIER.init();
+        
+        // 全部就绪，开始构建场景
+        initScene();
+        initPhysics();
+        
+        statusEl.style.opacity = '0'; // 隐藏提示
+        animate();
+      } catch (err) {
+        window.onerror(err.message, '', 0);
+      }
+    });
+
     // ==========================================
-    // 1. 轻量级轨道控制器 (零依赖，兼容移动端)
+    // 轻量级轨道控制器 (兼容触摸)
     // ==========================================
-    class SimpleOrbitControls {
-      constructor(camera, domElement) {
+    class SimpleControls {
+      constructor(camera, dom) {
         this.camera = camera;
-        this.domElement = domElement;
-        this.target = new THREE.Vector3(0, 0.3, 0);
-        this.minDistance = 1;
-        this.maxDistance = 30;
+        this.dom = dom;
+        this.target = new THREE.Vector3(0, 0.5, 0);
         this.spherical = new THREE.Spherical();
         this.sphericalDelta = new THREE.Spherical();
         this.scale = 1;
-        this.dragging = false;
-        this.pointers = [];
-
+        this.pointers = new Map();
+        
         const offset = new THREE.Vector3().copy(camera.position).sub(this.target);
         this.spherical.setFromVector3(offset);
-
-        this.domElement.addEventListener('pointerdown', this.onPointerDown.bind(this));
-        this.domElement.addEventListener('pointermove', this.onPointerMove.bind(this));
-        this.domElement.addEventListener('pointerup', this.onPointerUp.bind(this));
-        this.domElement.addEventListener('pointercancel', this.onPointerUp.bind(this));
-        this.domElement.addEventListener('wheel', this.onWheel.bind(this), { passive: false });
-      }
-
-      onPointerDown(e) {
-        this.domElement.setPointerCapture(e.pointerId);
-        this.pointers.push({ id: e.pointerId, x: e.clientX, y: e.clientY });
-        this.dragging = true;
-      }
-
-      onPointerMove(e) {
-        if (!this.dragging) return;
-        const pointer = this.pointers.find(p => p.id === e.pointerId);
-        if (!pointer) return;
-
-        if (this.pointers.length === 1) {
-          const deltaX = e.clientX - pointer.x;
-          const deltaY = e.clientY - pointer.y;
-          this.sphericalDelta.theta -= 2 * Math.PI * deltaX / this.domElement.clientHeight;
-          this.sphericalDelta.phi -= 2 * Math.PI * deltaY / this.domElement.clientHeight;
-        } else if (this.pointers.length === 2) {
-          const other = this.pointers.find(p => p.id !== e.pointerId);
-          const dx = e.clientX - other.x;
-          const dy = e.clientY - other.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (pointer.dist) {
-            this.scale *= pointer.dist / dist;
+        
+        dom.addEventListener('pointerdown', e => {
+          dom.setPointerCapture(e.pointerId);
+          this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        });
+        
+        dom.addEventListener('pointermove', e => {
+          if (!this.pointers.has(e.pointerId)) return;
+          const p = this.pointers.get(e.pointerId);
+          const dx = e.clientX - p.x;
+          const dy = e.clientY - p.y;
+          
+          if (this.pointers.size === 1) {
+            this.sphericalDelta.theta -= dx * 0.01;
+            this.sphericalDelta.phi -= dy * 0.01;
+          } else if (this.pointers.size === 2) {
+            const other = Array.from(this.pointers.values()).find(v => v !== p);
+            const dist = Math.hypot(e.clientX - other.x, e.clientY - other.y);
+            if (p.dist) this.scale *= p.dist / dist;
+            p.dist = dist;
           }
-          pointer.dist = dist;
-          return;
-        }
-        pointer.x = e.clientX;
-        pointer.y = e.clientY;
+          p.x = e.clientX;
+          p.y = e.clientY;
+        });
+        
+        dom.addEventListener('pointerup', e => {
+          dom.releasePointerCapture(e.pointerId);
+          this.pointers.delete(e.pointerId);
+        });
+        
+        dom.addEventListener('wheel', e => {
+          e.preventDefault();
+          this.scale *= e.deltaY > 0 ? 1.1 : 0.9;
+        }, { passive: false });
       }
-
-      onPointerUp(e) {
-        this.domElement.releasePointerCapture(e.pointerId);
-        this.pointers = this.pointers.filter(p => p.id !== e.pointerId);
-        if (this.pointers.length === 0) this.dragging = false;
-      }
-
-      onWheel(e) {
-        e.preventDefault();
-        this.scale *= e.deltaY > 0 ? 1.1 : 0.9;
-      }
-
+      
       update() {
         const offset = new THREE.Vector3().copy(this.camera.position).sub(this.target);
         this.spherical.setFromVector3(offset);
         this.spherical.theta += this.sphericalDelta.theta;
         this.spherical.phi += this.sphericalDelta.phi;
         this.spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, this.spherical.phi));
-        this.spherical.radius = Math.max(this.minDistance, Math.min(this.maxDistance, this.spherical.radius * this.scale));
+        this.spherical.radius = Math.max(1, Math.min(30, this.spherical.radius * this.scale));
         
         offset.setFromSpherical(this.spherical);
         this.camera.position.copy(this.target).add(offset);
@@ -128,7 +131,7 @@
     }
 
     // ==========================================
-    // 2. Epic 标准骨骼数据
+    // 骨骼定义与数据
     // ==========================================
     const BONE_DEFS = [
       { name: 'pelvis',      parent: null,        len: 0.22, rad: 0.16, pos: [0, 0.85, 0] },
@@ -175,34 +178,11 @@
       foot_r:     { swing: 0.4,  twist: 0.2,  stiffness: 40,  damping: 6 },
     };
 
-    // ==========================================
-    // 3. 启动与初始化
-    // ==========================================
-    async function start() {
-      try {
-        setStatus('正在加载同目录文件...');
-        
-        // 从同目录加载模块 (注意路径前缀 ./)
-        const threeModule = await import('./three.module.js');
-        const rapierModule = await import('./rapier.es.js');
-        
-        THREE = threeModule;
-        RAPIER = rapierModule.default || rapierModule;
-        
-        setStatus('正在初始化物理引擎...');
-        await RAPIER.init();
-        
-        initScene();
-        initPhysics();
-        
-        physReady = true;
-        setStatus('物理就绪', '#4caf50');
-        setTimeout(() => { statusEl.style.opacity = '0'; }, 1500);
-      } catch (err) {
-        console.error(err);
-        setStatus(`加载失败！\n请确保 three.module.js 和 rapier.es.js 在同一目录下。\n${err.message}`, '#ff6b6b');
-      }
-    }
+    let renderer, camera, scene, world, controls;
+    const boneMap = new Map();
+    const bodyMap = new Map();
+    const initialWorldQuats = new Map();
+    let physReady = false;
 
     function initScene() {
       scene = new THREE.Scene();
@@ -219,7 +199,7 @@
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       document.body.appendChild(renderer.domElement);
 
-      controls = new SimpleOrbitControls(camera, renderer.domElement);
+      controls = new SimpleControls(camera, renderer.domElement);
 
       scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 1.2));
       const dirLight = new THREE.DirectionalLight(0xffffff, 2.5);
@@ -250,14 +230,13 @@
       recordInitialPose();
       applyInitialImpulse();
 
-      animate();
+      physReady = true;
     }
 
     function buildSkeleton() {
       const root = new THREE.Bone();
       root.name = 'root';
-      const boneObjects = [];
-
+      
       BONE_DEFS.forEach(def => {
         const bone = new THREE.Bone();
         bone.name = def.name;
@@ -280,7 +259,6 @@
         bone.add(mesh);
 
         boneMap.set(def.name, bone);
-        boneObjects.push(bone);
       });
 
       scene.add(root);
@@ -420,9 +398,6 @@
         renderer.setSize(innerWidth, innerHeight);
       }
     });
-
-    // 启动
-    start();
   </script>
 </body>
 </html>
