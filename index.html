@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Three.js × Rapier 布娃娃 - 本地模块版</title>
+  <title>Three.js × Rapier 布娃娃 - 移动端优化版</title>
   <style>
     body { margin: 0; overflow: hidden; background: #111; }
     canvas { display: block; touch-action: none; }
@@ -21,7 +21,6 @@
   <div id="status">正在从本地加载依赖库...</div>
 
   <script>
-    // 1. 捕获全局 JS 错误
     window.onerror = function(msg, url, line, col, error) {
       const el = document.getElementById('status');
       if (el) {
@@ -30,27 +29,22 @@
         el.innerHTML = `❌ 发生错误：\n${msg}\n位置: 行 ${line}`;
       }
     };
-    // 2. 捕获模块加载失败（如 404 或跨域限制）
     window.addEventListener('unhandledrejection', function(event) {
       const el = document.getElementById('status');
       if (el) {
         el.className = 'error';
         el.style.opacity = '1';
-        el.innerHTML = `❌ 模块加载失败：\n请确保 three.module.js 和 rapier.es.js 文件存在且文件名完全一致（注意大小写）。\n\n错误信息：${event.reason}`;
+        el.innerHTML = `❌ 模块加载失败：\n请确保 three.module.js 和 rapier.es.js 文件存在。\n\n错误信息：${event.reason}`;
       }
     });
   </script>
 
-  <!-- 3. 直接静态引入同目录下的文件 -->
   <script type="module">
     import * as THREE from './three.module.js';
     import RAPIER from './rapier.es.js';
 
     const statusEl = document.getElementById('status');
 
-    // ==========================================
-    // 轻量级轨道控制器 (兼容触摸)
-    // ==========================================
     class SimpleControls {
       constructor(camera, dom) {
         this.camera = camera;
@@ -121,9 +115,6 @@
       }
     }
 
-    // ==========================================
-    // 骨骼定义与数据
-    // ==========================================
     const BONE_DEFS = [
       { name: 'pelvis',      parent: null,        len: 0.22, rad: 0.16, pos: [0, 0.85, 0] },
       { name: 'spine_01',    parent: 'pelvis',    len: 0.12, rad: 0.12, pos: [0, 0.11, 0] },
@@ -175,13 +166,9 @@
     const initialWorldQuats = new Map();
     let physReady = false;
 
-    // ==========================================
-    // 核心逻辑
-    // ==========================================
     async function start() {
       try {
         statusEl.textContent = '正在初始化物理引擎...';
-        // 初始化 WASM
         await RAPIER.init();
         
         initScene();
@@ -202,12 +189,29 @@
       camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
       camera.position.set(4, 2, 6);
 
-      renderer = new THREE.WebGLRenderer({ antialias: true });
+      // 移动端性能优化：关闭抗锯齿，限制像素比
+      renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
       renderer.setSize(innerWidth, innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+      
+      // 阴影降级
       renderer.shadowMap.enabled = true;
-      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.shadowMap.type = THREE.PCFShadowMap; 
+
       document.body.appendChild(renderer.domElement);
+
+      // WebGL 上下文丢失恢复机制
+      renderer.domElement.addEventListener('webglcontextlost', function(event) {
+        event.preventDefault();
+        console.warn('WebGL Context Lost. Waiting for restore...');
+        statusEl.textContent = '图形上下文丢失，正在恢复...';
+        statusEl.style.opacity = '1';
+      }, false);
+
+      renderer.domElement.addEventListener('webglcontextrestored', function() {
+        console.log('WebGL Context Restored.');
+        statusEl.style.opacity = '0';
+      }, false);
 
       controls = new SimpleControls(camera, renderer.domElement);
 
@@ -215,7 +219,8 @@
       const dirLight = new THREE.DirectionalLight(0xffffff, 2.5);
       dirLight.position.set(5, 8, 5);
       dirLight.castShadow = true;
-      dirLight.shadow.mapSize.set(1024, 1024);
+      // 降低阴影贴图分辨率
+      dirLight.shadow.mapSize.set(512, 512); 
       dirLight.shadow.camera.left = -5;
       dirLight.shadow.camera.right = 5;
       dirLight.shadow.camera.top = 5;
@@ -336,16 +341,17 @@
     function applyInitialImpulse() {
       const pelvisBody = bodyMap.get('pelvis');
       if (pelvisBody) {
-        pelvisBody.applyImpulse({ x: 2.5, y: 1.5, z: 3.0 }, true);
-        pelvisBody.applyTorqueImpulse({ x: 0.5, y: 0.2, z: 1.0 }, true);
+        // 微微调弱冲量，防止穿模爆炸
+        pelvisBody.applyImpulse({ x: 1.8, y: 1.0, z: 2.0 }, true);
+        pelvisBody.applyTorqueImpulse({ x: 0.3, y: 0.1, z: 0.5 }, true);
       }
       ['upperarm_l', 'upperarm_r', 'thigh_l', 'thigh_r'].forEach(name => {
         const body = bodyMap.get(name);
         if (body) {
           body.applyImpulse({
-            x: (Math.random() - 0.5) * 1.5,
-            y: (Math.random() - 0.5) * 1.0,
-            z: (Math.random() - 0.5) * 1.5
+            x: (Math.random() - 0.5) * 1.0,
+            y: (Math.random() - 0.5) * 0.8,
+            z: (Math.random() - 0.5) * 1.0
           }, true);
         }
       });
@@ -388,7 +394,8 @@
     function animate() {
       requestAnimationFrame(animate);
       const now = performance.now();
-      const delta = Math.min((now - lastTime) / 1000, 0.05);
+      // 限制单帧最大时间步长为 0.033 (约 30fps)，防止掉帧导致物理爆炸
+      const delta = Math.min((now - lastTime) / 1000, 0.033);
       lastTime = now;
 
       if (physReady && world) {
@@ -401,6 +408,15 @@
       renderer.render(scene, camera);
     }
 
+    // 页面切到后台时，物理暂停，切回来时重置时间，防止回来瞬间发生超大步长导致物理爆炸
+    let isTabActive = true;
+    document.addEventListener('visibilitychange', () => {
+      isTabActive = !document.hidden;
+      if (isTabActive) {
+        lastTime = performance.now();
+      }
+    });
+
     window.addEventListener('resize', () => {
       if (camera && renderer) {
         camera.aspect = innerWidth / innerHeight;
@@ -409,7 +425,6 @@
       }
     });
 
-    // 启动
     start();
   </script>
 </body>
