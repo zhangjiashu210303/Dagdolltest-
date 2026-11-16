@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Three.js × Rapier 布娃娃 - 稳定在线版</title>
+  <title>Three.js × Rapier 布娃娃 - 本地模块版</title>
   <style>
     body { margin: 0; overflow: hidden; background: #111; }
     canvas { display: block; touch-action: none; }
@@ -18,48 +18,35 @@
   </style>
 </head>
 <body>
-  <div id="status">正在从 CDN 加载依赖...</div>
-
-  <!-- 使用最稳定的 UMD 形式加载库（全球 CDN 节点） -->
-  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.12.0/rapier.js"></script>
+  <div id="status">正在从本地加载依赖库...</div>
 
   <script>
-    // 捕获所有报错并显示在屏幕上
+    // 1. 捕获全局 JS 错误
     window.onerror = function(msg, url, line, col, error) {
       const el = document.getElementById('status');
-      el.className = 'error';
-      el.style.opacity = '1';
-      el.innerHTML = `❌ 发生错误：\n${msg}\n位置: 行 ${line}`;
+      if (el) {
+        el.className = 'error';
+        el.style.opacity = '1';
+        el.innerHTML = `❌ 发生错误：\n${msg}\n位置: 行 ${line}`;
+      }
     };
-
-    window.addEventListener('DOMContentLoaded', async () => {
-      const statusEl = document.getElementById('status');
-      
-      // 检查库是否成功加载
-      if (typeof THREE === 'undefined') {
-        return window.onerror('未找到 THREE 库，请检查网络是否能访问 cdn.jsdelivr.net', '', 0);
-      }
-      if (typeof RAPIER === 'undefined') {
-        return window.onerror('未找到 RAPIER 库，请检查网络是否能访问 cdn.jsdelivr.net', '', 0);
-      }
-
-      statusEl.textContent = '正在初始化物理引擎 (WASM)...';
-      
-      try {
-        // 初始化 Rapier WASM
-        await RAPIER.init();
-        
-        // 全部就绪，开始构建场景
-        initScene();
-        initPhysics();
-        
-        statusEl.style.opacity = '0'; // 隐藏提示
-        animate();
-      } catch (err) {
-        window.onerror(err.message, '', 0);
+    // 2. 捕获模块加载失败（如 404 或跨域限制）
+    window.addEventListener('unhandledrejection', function(event) {
+      const el = document.getElementById('status');
+      if (el) {
+        el.className = 'error';
+        el.style.opacity = '1';
+        el.innerHTML = `❌ 模块加载失败：\n请确保 three.module.js 和 rapier.es.js 文件存在且文件名完全一致（注意大小写）。\n\n错误信息：${event.reason}`;
       }
     });
+  </script>
+
+  <!-- 3. 直接静态引入同目录下的文件 -->
+  <script type="module">
+    import * as THREE from './three.module.js';
+    import RAPIER from './rapier.es.js';
+
+    const statusEl = document.getElementById('status');
 
     // ==========================================
     // 轻量级轨道控制器 (兼容触摸)
@@ -93,16 +80,20 @@
             this.sphericalDelta.phi -= dy * 0.01;
           } else if (this.pointers.size === 2) {
             const other = Array.from(this.pointers.values()).find(v => v !== p);
-            const dist = Math.hypot(e.clientX - other.x, e.clientY - other.y);
-            if (p.dist) this.scale *= p.dist / dist;
-            p.dist = dist;
+            if (other) {
+              const dist = Math.hypot(e.clientX - other.x, e.clientY - other.y);
+              if (p.dist) this.scale *= p.dist / dist;
+              p.dist = dist;
+            }
           }
           p.x = e.clientX;
           p.y = e.clientY;
         });
         
         dom.addEventListener('pointerup', e => {
-          dom.releasePointerCapture(e.pointerId);
+          if (dom.hasPointerCapture(e.pointerId)) {
+            dom.releasePointerCapture(e.pointerId);
+          }
           this.pointers.delete(e.pointerId);
         });
         
@@ -183,6 +174,25 @@
     const bodyMap = new Map();
     const initialWorldQuats = new Map();
     let physReady = false;
+
+    // ==========================================
+    // 核心逻辑
+    // ==========================================
+    async function start() {
+      try {
+        statusEl.textContent = '正在初始化物理引擎...';
+        // 初始化 WASM
+        await RAPIER.init();
+        
+        initScene();
+        initPhysics();
+        
+        statusEl.style.opacity = '0';
+        animate();
+      } catch (err) {
+        window.onerror('初始化失败: ' + err.message, '', 0);
+      }
+    }
 
     function initScene() {
       scene = new THREE.Scene();
@@ -398,6 +408,9 @@
         renderer.setSize(innerWidth, innerHeight);
       }
     });
+
+    // 启动
+    start();
   </script>
 </body>
 </html>
